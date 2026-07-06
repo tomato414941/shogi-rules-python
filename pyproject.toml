@@ -1,0 +1,20 @@
+[project]
+name = "shogi-rules"
+version = "0.1.0"
+description = "Self-contained implementation of the rules of shogi: board state, legal moves, and game termination"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "python-shogi>=1.1.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shogi_rules"]
