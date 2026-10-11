@@ -66,6 +66,8 @@ _SFEN_LETTERS = {
     **{letter.lower(): (WHITE, piece_type) for piece_type, letter in PIECE_TO_SFEN.items()},
 }
 _SFEN_FIELD_BREAK = re.compile(r"[ \t\n\v\f\r]+")
+# A move from one square to another, "+" after it to promote, or a drop of a piece onto a square.
+_USI_MOVE = re.compile(r"([1-9][a-i])([1-9][a-i])(\+?)|([PLNSGBR])\*([1-9][a-i])")
 # The pieces of a shogi set besides the kings, promoted ones counted as unpromoted.
 _PIECE_SET = {PAWN: 18, LANCE: 4, KNIGHT: 4, SILVER: 4, GOLD: 4, BISHOP: 2, ROOK: 2}
 _PIECE_NAMES = {
@@ -98,17 +100,20 @@ class Move:
 
     @classmethod
     def from_usi(cls, usi: str) -> Move:
-        if "*" in usi:
-            piece_symbol, square_name = usi.split("*", 1)
+        match = _USI_MOVE.fullmatch(usi)
+        if match is None:
+            raise ValueError(f"invalid usi move: {usi!r}")
+        from_name, to_name, promotion, piece_symbol, drop_name = match.groups()
+        if piece_symbol:
             return cls(
                 from_square=None,
-                to_square=square_from_name(square_name),
+                to_square=square_from_name(drop_name),
                 drop_piece_type=SFEN_TO_PIECE[piece_symbol],
             )
         return cls(
-            from_square=square_from_name(usi[:2]),
-            to_square=square_from_name(usi[2:4]),
-            promotion=usi.endswith("+"),
+            from_square=square_from_name(from_name),
+            to_square=square_from_name(to_name),
+            promotion=promotion == "+",
         )
 
     def usi(self) -> str:
@@ -238,7 +243,7 @@ class Board:
         for move in self._pseudo_legal_moves_for_legality_check():
             if self._is_illegal_pawn_drop_mate(move):
                 continue
-            self.push(move)
+            self._push(move)
             try:
                 if not self.is_attacked_by(self.turn, self._king_squares[1 - self.turn]):
                     moves.append(move)
@@ -250,7 +255,7 @@ class Board:
         for move in self._pseudo_legal_moves_for_legality_check():
             if self._is_illegal_pawn_drop_mate(move):
                 continue
-            self.push(move)
+            self._push(move)
             try:
                 if not self.is_attacked_by(self.turn, self._king_squares[1 - self.turn]):
                     return True
@@ -270,7 +275,7 @@ class Board:
             tactical = move.promotion or (move.to_square is not None and self.board[move.to_square] != 0)
             if not tactical and not include_quiet_checks:
                 continue
-            self.push(move)
+            self._push(move)
             try:
                 if self.is_attacked_by(self.turn, self._king_squares[1 - self.turn]):
                     continue
@@ -280,10 +285,57 @@ class Board:
                 self.pop()
         return moves
 
+    # Plays a move given as text only if it is legal.
     def push_usi(self, usi: str) -> None:
-        self.push(Move.from_usi(usi))
+        move = Move.from_usi(usi)
+        if move not in self.generate_legal_moves():
+            raise ValueError(f"illegal move {usi!r} in {self.sfen()!r}")
+        self._push(move)
 
+    # Plays a move without checking that it is legal, which is the caller's to ensure (a move from legal_moves is).
+    # Only a move that would break the board raises ValueError, leaving the position unchanged.
     def push(self, move: Move) -> None:
+        self._check_move(move)
+        self._push(move)
+
+    # A null move has no squares. Any other move goes to a square on the board without taking a king: a piece of the
+    # side to move from a square, taking no piece of its own and promoting only if it can, or a piece in hand dropped
+    # onto an empty square.
+    def _check_move(self, move: Move) -> None:
+        from_square, to_square = move.from_square, move.to_square
+        if to_square is None:
+            if from_square is None and not move.promotion and move.drop_piece_type is None:
+                return
+            raise ValueError("a move needs a square to go to")
+        if not 0 <= to_square < BOARD_SIZE:
+            raise ValueError(f"square {to_square} is not on the board")
+        target = self.board[to_square]
+        if abs(target) == KING:
+            raise ValueError("king captures are not legal moves")
+        black = self.turn == BLACK
+        if from_square is None:
+            if move.drop_piece_type not in _PIECE_SET:
+                raise ValueError("drop moves require a piece type that can be in hand")
+            if move.promotion:
+                raise ValueError("dropped pieces cannot promote")
+            if target:
+                raise ValueError(f"cannot drop onto the occupied square {square_name(to_square)}")
+            if self.hands[self.turn].get(move.drop_piece_type, 0) <= 0:
+                raise ValueError("cannot remove a piece that is not in hand")
+            return
+        if move.drop_piece_type is not None:
+            raise ValueError("a move from a square drops no piece")
+        if not 0 <= from_square < BOARD_SIZE:
+            raise ValueError(f"square {from_square} is not on the board")
+        piece = self.board[from_square]
+        if not piece or (piece > 0) != black:
+            raise ValueError(f"the side to move has no piece on {square_name(from_square)}")
+        if target and (target > 0) == black:
+            raise ValueError(f"the side to move cannot take its own piece on {square_name(to_square)}")
+        if move.promotion and abs(piece) not in PROMOTED:
+            raise ValueError(f"the piece on {square_name(from_square)} cannot promote")
+
+    def _push(self, move: Move) -> None:
         previous_turn = self.turn
         previous_move_number = self.move_number
         previous_hash = self._hash
@@ -294,11 +346,7 @@ class Board:
             self.move_stack.append(_Undo(move, 0, 0, previous_turn, previous_move_number, previous_hash))
             return
         captured_piece = self.board[move.to_square]
-        if abs(captured_piece) == KING:
-            raise ValueError("king captures are not legal moves")
         if move.from_square is None:
-            if move.drop_piece_type is None:
-                raise ValueError("drop moves require a piece type")
             moved_piece = _signed_piece(previous_turn, move.drop_piece_type)
             self._remove_hand(previous_turn, move.drop_piece_type)
             self.board[move.to_square] = moved_piece
@@ -534,7 +582,7 @@ class Board:
     def _is_illegal_pawn_drop_mate(self, move: Move) -> bool:
         if move.from_square is not None or move.drop_piece_type != PAWN:
             return False
-        self.push(move)
+        self._push(move)
         try:
             defender = self.turn
             if not self.is_attacked_by(1 - defender, self.king_square(defender)):
@@ -545,7 +593,7 @@ class Board:
 
     def _has_legal_evasion_without_pawn_drop_mate_check(self) -> bool:
         for response in self._pseudo_legal_moves():
-            self.push(response)
+            self._push(response)
             try:
                 if not self.is_attacked_by(self.turn, self.king_square(1 - self.turn)):
                     return True
@@ -607,6 +655,8 @@ def square_name(square: int) -> str:
 
 
 def square_from_name(name: str) -> int:
+    if len(name) != 2 or not "1" <= name[0] <= "9" or not "a" <= name[1] <= "i":
+        raise ValueError(f"invalid square name: {name!r}")
     file_index = 9 - int(name[0])
     rank = ord(name[1]) - ord("a")
     return rank * 9 + file_index

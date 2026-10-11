@@ -5,8 +5,9 @@ import unittest
 
 import shogi
 
-from shogi_rules import BLACK, KING, PAWN, WHITE, Board
+from shogi_rules import BLACK, KING, PAWN, PROM_PAWN, WHITE, Board, Move
 
+STARTPOS = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
 MALFORMED_SFENS = (
     "",
     "4k4/9/9/9/9/9/9/9/4K4 b",
@@ -67,6 +68,44 @@ READABLE_SFENS = (
     ("+P3k3+L/+N8/9/9/9/9/4P4/4+P4/4K4 b - 1", "+P3k3+L/+N8/9/9/9/9/4P4/4+P4/4K4 b - 1"),
 )
 
+MALFORMED_USIS = (
+    "",
+    "7g7",
+    "7g7fx",
+    "7g7f++",
+    "7g7f=",
+    " 7g7f",
+    "7g7f\n",
+    "0g0f",
+    "7j7f",
+    "7G7F",
+    "\uff17g7f",
+    "p*5e",
+    "K*5e",
+    "+P*5e",
+    "P*5",
+    "P*5j",
+    "P*5e+",
+    "P5e",
+    "*5e",
+)
+# Each position with a move that is not legal there.
+ILLEGAL_USIS = (
+    (STARTPOS, "5e5d"),
+    (STARTPOS, "5a5b"),
+    (STARTPOS, "6i5h+"),
+    (STARTPOS, "2h2b"),
+    (STARTPOS, "7g7f+"),
+    (STARTPOS, "7g7e"),
+    (STARTPOS, "5i5a"),
+    (STARTPOS, "P*5e"),
+    ("4k4/9/9/9/9/9/4P4/9/4K4 b P 1", "P*5e"),
+    ("4k4/9/9/9/9/9/9/9/4K4 b P 1", "P*1a"),
+    ("4k4/P8/9/9/9/9/9/9/4K4 b - 1", "9b9a"),
+    ("k3r4/9/9/9/9/9/9/4G4/4K4 b - 1", "5h4h"),
+    ("8k/9/6NG1/9/9/9/9/9/4K4 b P 1", "P*1b"),
+)
+
 
 class SfenTest(unittest.TestCase):
     def test_rejects_malformed_sfen(self) -> None:
@@ -108,6 +147,73 @@ class SfenTest(unittest.TestCase):
 
         self.assertEqual(board.sfen(), sfen)
         self.assertEqual(len(board.move_stack), 1)
+
+
+class PushTest(unittest.TestCase):
+    def assert_unchanged(self, board: Board, sfen: str, zobrist_hash: int, plies: int) -> None:
+        self.assertEqual(board.sfen(), sfen)
+        self.assertEqual(board.zobrist_hash(), zobrist_hash)
+        self.assertEqual(len(board.move_stack), plies)
+
+    def test_rejects_malformed_usi(self) -> None:
+        for usi in MALFORMED_USIS:
+            with self.subTest(usi=usi), self.assertRaises(ValueError):
+                Move.from_usi(usi)
+
+    def test_push_usi_rejects_illegal_moves_and_keeps_the_position(self) -> None:
+        for sfen, usi in ILLEGAL_USIS:
+            with self.subTest(sfen=sfen, usi=usi):
+                board = Board.from_sfen(sfen)
+                zobrist_hash = board.zobrist_hash()
+                with self.assertRaises(ValueError):
+                    board.push_usi(usi)
+                self.assert_unchanged(board, sfen, zobrist_hash, 0)
+
+    def test_push_usi_plays_legal_moves(self) -> None:
+        board = Board.startpos()
+        for usi in ("7g7f", "3c3d", "8h2b+", "3a2b", "B*5e"):
+            board.push_usi(usi)
+
+        self.assertEqual(board.sfen(), "lnsgkg1nl/1r5s1/pppppp1pp/6p2/4B4/2P6/PP1PPPPPP/7R1/LNSGKGSNL w b 6")
+
+    def test_push_rejects_moves_that_break_the_board(self) -> None:
+        cases = (
+            (STARTPOS, Move(None, None, promotion=True)),
+            (STARTPOS, Move(None, None, drop_piece_type=PAWN)),
+            (STARTPOS, Move(76, None)),
+            (STARTPOS, Move(76, 81)),
+            (STARTPOS, Move(81, 40)),
+            (STARTPOS, Move(-1, 40)),
+            (STARTPOS, Move(60, -5)),
+            (STARTPOS, Move(40, 31)),
+            (STARTPOS, Move(4, 13)),
+            (STARTPOS, Move(75, 67, promotion=True)),
+            (STARTPOS, Move(76, 67, promotion=True)),
+            (STARTPOS, Move(75, 74)),
+            (STARTPOS, Move(75, 76)),
+            (STARTPOS, Move(None, 40, drop_piece_type=PAWN)),
+            (STARTPOS, Move(None, 40, drop_piece_type=KING)),
+            (STARTPOS, Move(None, 40, drop_piece_type=PROM_PAWN)),
+            ("4k4/9/9/9/9/9/4P4/9/4K4 b P 1", Move(None, 58, drop_piece_type=PAWN)),
+            ("4k4/9/9/9/9/9/4P4/9/4K4 b P 1", Move(None, 40, promotion=True, drop_piece_type=PAWN)),
+            ("4k4/9/9/9/9/9/4P4/9/4K4 b P 1", Move(58, 49, drop_piece_type=PAWN)),
+            ("4k4/9/9/9/9/9/4G4/9/4K4 b - 1", Move(58, 49, promotion=True)),
+        )
+        for sfen, move in cases:
+            with self.subTest(sfen=sfen, move=move):
+                board = Board.from_sfen(sfen)
+                zobrist_hash = board.zobrist_hash()
+                with self.assertRaises(ValueError):
+                    board.push(move)
+                self.assert_unchanged(board, sfen, zobrist_hash, 0)
+
+    def test_push_plays_null_moves(self) -> None:
+        board = Board.startpos()
+        board.push(Move(None, None))
+
+        self.assertEqual(board.sfen(), STARTPOS.replace(" b - 1", " w - 2"))
+        board.pop()
+        self.assertEqual(board.sfen(), STARTPOS)
 
 
 class BoardOracleTest(unittest.TestCase):
