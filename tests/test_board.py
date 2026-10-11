@@ -5,7 +5,109 @@ import unittest
 
 import shogi
 
-from shogi_rules import Board
+from shogi_rules import BLACK, KING, PAWN, WHITE, Board
+
+MALFORMED_SFENS = (
+    "",
+    "4k4/9/9/9/9/9/9/9/4K4 b",
+    "4k4/9/9/9/9/9/9/9/4K4 b - 1 moves 7g7f",
+    "kK b - 1",
+    "4k4/9/9/9/9/9/9/4K4 b - 1",
+    "4k4/9/9/9/9/9/9/9/4K4/ b - 1",
+    "4k5/9/9/9/9/9/9/9/4K4 b - 1",
+    "4k3/9/9/9/9/9/9/9/4K4 b - 1",
+    "4k4/9/9/9/9/9/9/9/04K4 b - 1",
+    "4k4/9/9/9/9/9/9/9/4X4 b - 1",
+    "4k4/9/9/9/9/9/9/+1P7/4K4 b - 1",
+    "4k4/9/9/9/9/9/9/++P7/4K4 b - 1",
+    "4k4/9/9/9/9/9/9/+G8/4K4 b - 1",
+    "4k4/9/9/9/9/9/9/8+/4K4 b - 1",
+    "4k4/9/9/9/9/9/9/9/4K4 x - 1",
+    "4k4/9/9/9/9/9/9/9/4K4 B - 1",
+    "4k4/9/9/9/9/9/9/9/4K4\u3000b - 1",
+    "4k4/9/9/9/9/9/9/9/4K4 b 0P 1",
+    "4k4/9/9/9/9/9/9/9/4K4 b PP 1",
+    "4k4/9/9/9/9/9/9/9/4K4 b 2PP 1",
+    "4k4/9/9/9/9/9/9/9/4K4 b P2 1",
+    "4k4/9/9/9/9/9/9/9/4K4 b K 1",
+    "4k4/9/9/9/9/9/9/9/4K4 b +P 1",
+    "4k4/9/9/9/9/9/9/9/4K4 b -P 1",
+    "4k4/9/9/9/9/9/9/9/4K4 b \uff12P 1",
+    "4k4/9/9/9/9/9/9/9/4K4 b - 0",
+    "4k4/9/9/9/9/9/9/9/4K4 b - -1",
+    "4k4/9/9/9/9/9/9/9/4K4 b - +1",
+    "4k4/9/9/9/9/9/9/9/4K4 b - 1_000",
+    "4k4/9/9/9/9/9/9/9/4K4 b - \uff11",
+    "4k4/9/9/9/9/9/9/9/4K4 b - 1000000001",
+    "4k4/9/9/9/9/9/9/9/4K4 b - 99999999999",
+)
+IMPOSSIBLE_SFENS = (
+    "4k4/9/9/9/9/9/9/9/9 b - 1",
+    "4k4/9/9/9/9/9/9/9/K3K4 b - 1",
+    "4k4/9/9/9/9/9/9/9/4K4 b 10P9p 1",
+    "4k4/9/9/9/9/9/9/9/4K4 b 300P 1",
+    "4k4/9/9/9/9/9/9/9/4K4 b 3G2g 1",
+    "4k4/9/9/9/9/9/9/+R8/4K4 b 2R 1",
+    "4k4/9/9/9/9/9/4P4/4P4/4K4 b - 1",
+    "P3k4/9/9/9/9/9/9/9/4K4 b - 1",
+    "4k3L/9/9/9/9/9/9/9/4K4 b - 1",
+    "4k4/N8/9/9/9/9/9/9/4K4 b - 1",
+    "4k4/9/9/9/9/9/9/9/p3K4 b - 1",
+    "4k4/9/9/9/9/9/9/4r4/4K4 w - 1",
+)
+# Each SFEN with how this library writes it back.
+READABLE_SFENS = (
+    ("4k4/9/9/9/9/9/9/9/4K4 b -", "4k4/9/9/9/9/9/9/9/4K4 b - 1"),
+    (" 4k4/9/9/9/9/9/9/9/4K4 \t b  -\n 1 ", "4k4/9/9/9/9/9/9/9/4K4 b - 1"),
+    ("4k4/45/9/9/9/9/9/9/4K4 b - 1", "4k4/9/9/9/9/9/9/9/4K4 b - 1"),
+    ("4k4/9/9/9/9/9/9/9/4K4 b pR1P02s 007", "4k4/9/9/9/9/9/9/9/4K4 b RP2sp 7"),
+    ("4k4/9/9/9/9/9/9/9/4K4 b 2R2B4G4S4N4L18P 1", "4k4/9/9/9/9/9/9/9/4K4 b 2R2B4G4S4N4L18P 1"),
+    ("4k4/9/9/9/9/9/9/9/4K4 w - 1000000000", "4k4/9/9/9/9/9/9/9/4K4 w - 1000000000"),
+    ("4k4/9/9/9/9/9/9/4r4/4K4 b - 1", "4k4/9/9/9/9/9/9/4r4/4K4 b - 1"),
+    ("+P3k3+L/+N8/9/9/9/9/4P4/4+P4/4K4 b - 1", "+P3k3+L/+N8/9/9/9/9/4P4/4+P4/4K4 b - 1"),
+)
+
+
+class SfenTest(unittest.TestCase):
+    def test_rejects_malformed_sfen(self) -> None:
+        for sfen in MALFORMED_SFENS:
+            with self.subTest(sfen=sfen), self.assertRaises(ValueError):
+                Board.from_sfen(sfen)
+
+    def test_rejects_positions_that_cannot_occur(self) -> None:
+        for sfen in IMPOSSIBLE_SFENS:
+            with self.subTest(sfen=sfen), self.assertRaises(ValueError):
+                Board.from_sfen(sfen)
+
+    def test_reads_sfen_variants_as_the_same_position(self) -> None:
+        for sfen, written in READABLE_SFENS:
+            with self.subTest(sfen=sfen):
+                self.assertEqual(Board.from_sfen(sfen).sfen(), written)
+
+    def test_rejects_positions_that_cannot_occur_when_built_directly(self) -> None:
+        board = [0] * 81
+        board[4] = -KING
+        with self.assertRaises(ValueError):
+            Board(board)
+        board[76] = KING
+        board[67] = board[58] = PAWN
+        with self.assertRaises(ValueError):
+            Board(board)
+        board[58] = 0
+        with self.assertRaises(ValueError):
+            Board(board, hands={BLACK: {PAWN: 18}, WHITE: {}})
+        self.assertEqual(Board(board).sfen(), "4k4/9/9/9/9/9/9/4P4/4K4 b - 1")
+
+    def test_keeps_the_position_when_set_sfen_rejects(self) -> None:
+        board = Board.startpos()
+        board.push_usi("7g7f")
+        sfen = board.sfen()
+
+        with self.assertRaises(ValueError):
+            board.set_sfen("4k4/9/9/9/9/9/9/9/K3K4 b - 1")
+
+        self.assertEqual(board.sfen(), sfen)
+        self.assertEqual(len(board.move_stack), 1)
 
 
 class BoardOracleTest(unittest.TestCase):

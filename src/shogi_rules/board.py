@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 BLACK = 0
 WHITE = 1
@@ -59,6 +60,33 @@ PIECE_TO_SFEN = {
     KING: "K",
 }
 SFEN_TO_PIECE = {value: key for key, value in PIECE_TO_SFEN.items()}
+# Upper case for black, lower case for white.
+_SFEN_LETTERS = {
+    **{letter: (BLACK, piece_type) for piece_type, letter in PIECE_TO_SFEN.items()},
+    **{letter.lower(): (WHITE, piece_type) for piece_type, letter in PIECE_TO_SFEN.items()},
+}
+_SFEN_FIELD_BREAK = re.compile(r"[ \t\n\v\f\r]+")
+# The pieces of a shogi set besides the kings, promoted ones counted as unpromoted.
+_PIECE_SET = {PAWN: 18, LANCE: 4, KNIGHT: 4, SILVER: 4, GOLD: 4, BISHOP: 2, ROOK: 2}
+_PIECE_NAMES = {
+    PAWN: "pawn",
+    LANCE: "lance",
+    KNIGHT: "knight",
+    SILVER: "silver",
+    GOLD: "gold",
+    BISHOP: "bishop",
+    ROOK: "rook",
+}
+_COLOR_NAMES = ("black", "white")
+_MAX_MOVE_NUMBER = 1_000_000_000
+# The kind each signed piece counts as in a set, indexed by the signed piece plus PROM_ROOK; 0 for empty squares and
+# kings.
+_SET_KINDS = tuple(
+    0 if abs(piece) in (0, KING) else UNPROMOTED.get(abs(piece), abs(piece))
+    for piece in range(-PROM_ROOK, PROM_ROOK + 1)
+)
+# Pieces that can never move from the farthest rank of their side.
+_STUCK_ON_LAST_RANK = (frozenset((PAWN, LANCE, KNIGHT)), frozenset((-PAWN, -LANCE, -KNIGHT)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,7 +149,9 @@ class Board:
         self.turn = turn
         self.hands = hands or {BLACK: {}, WHITE: {}}
         self.move_number = move_number
+        self._check_values()
         self._king_squares = self._find_king_squares()
+        self._check_position()
         self._hash = self._compute_hash()
         self.move_stack: list[_Undo] = []
 
@@ -131,31 +161,26 @@ class Board:
 
     @classmethod
     def from_sfen(cls, sfen: str) -> Board:
-        board_part, turn_part, hand_part, *remaining = sfen.split()
-        board = [0] * BOARD_SIZE
-        square = 0
-        for char_index, char in enumerate(board_part):
-            if char == "/":
-                continue
-            if char.isdigit():
-                square += int(char)
-                continue
-            promoted = char == "+"
-            if promoted:
-                continue
-            previous = board_part[char_index - 1] if char_index > 0 else ""
-            piece_type = SFEN_TO_PIECE[char.upper()]
-            if previous == "+":
-                piece_type = PROMOTED[piece_type]
-            color = BLACK if char.isupper() else WHITE
-            board[square] = _signed_piece(color, piece_type)
-            square += 1
-        return cls(
-            board,
-            turn=BLACK if turn_part == "b" else WHITE,
-            hands=_parse_hands(hand_part),
-            move_number=int(remaining[0]) if remaining else 1,
-        )
+        # Fields are separated by runs of ASCII whitespace; the move number may be left out.
+        fields = [field for field in _SFEN_FIELD_BREAK.split(sfen) if field]
+        if len(fields) not in (3, 4):
+            raise ValueError(f"sfen needs a board, a side to move, hands and optionally a move number: {sfen!r}")
+        board_part, turn_part, hand_part, *move_part = fields
+        if turn_part not in ("b", "w"):
+            raise ValueError(f"sfen side to move must be b or w: {sfen!r}")
+        if move_part and not _is_decimal(move_part[0]):
+            raise ValueError(f"sfen move number must be a decimal number: {sfen!r}")
+        board = _parse_board(board_part, sfen)
+        hands = _parse_hands(hand_part, sfen)
+        try:
+            return cls(
+                board,
+                turn=BLACK if turn_part == "b" else WHITE,
+                hands=hands,
+                move_number=int(move_part[0]) if move_part else 1,
+            )
+        except ValueError as error:
+            raise ValueError(f"{error}: {sfen!r}") from None
 
     def sfen(self) -> str:
         rows: list[str] = []
@@ -363,14 +388,61 @@ class Board:
     def king_square(self, color: int) -> int:
         return self._king_squares[color]
 
+    def _check_values(self) -> None:
+        board = self.board
+        if len(board) != BOARD_SIZE or min(board) < -PROM_ROOK or max(board) > PROM_ROOK:
+            raise ValueError("board must hold 81 squares, each empty or a piece")
+        if self.turn not in (BLACK, WHITE):
+            raise ValueError("turn must be BLACK or WHITE")
+        if set(self.hands) != {BLACK, WHITE} or any(
+            piece_type not in _PIECE_SET or count < 0 for hand in self.hands.values() for piece_type, count in hand.items()
+        ):
+            raise ValueError("hands must count, for each side, pieces that can be dropped")
+        if not 1 <= self.move_number <= _MAX_MOVE_NUMBER:
+            raise ValueError(f"move number must be from 1 to {_MAX_MOVE_NUMBER}")
+
     def _find_king_squares(self) -> list[int]:
-        king_squares = [-1, -1]
-        for square, piece in enumerate(self.board):
-            if abs(piece) == KING:
-                king_squares[_piece_color(piece)] = square
-        if king_squares[BLACK] < 0 or king_squares[WHITE] < 0:
-            raise ValueError("both kings are required")
-        return king_squares
+        board = self.board
+        if board.count(KING) != 1 or board.count(-KING) != 1:
+            raise ValueError("each side needs exactly one king")
+        return [board.index(KING), board.index(-KING)]
+
+    # A position that can occur in a game: no more pieces than a set has, no two unpromoted pawns of a side on a
+    # file, no piece where it can never move, and the side not to move not in check.
+    def _check_position(self) -> None:
+        board = self.board
+        counts = [0] * (ROOK + 1)
+        for piece in board:
+            if piece:
+                counts[_SET_KINDS[piece + PROM_ROOK]] += 1
+        for hand in self.hands.values():
+            for piece_type, count in hand.items():
+                counts[piece_type] += count
+        for piece_type, limit in _PIECE_SET.items():
+            if counts[piece_type] > limit:
+                raise ValueError(f"{counts[piece_type]} {_PIECE_NAMES[piece_type]}s, more than the {limit} in a set")
+        for file_index in range(9):
+            column = board[file_index::9]
+            for color, pawn in ((BLACK, PAWN), (WHITE, -PAWN)):
+                if column.count(pawn) > 1:
+                    raise ValueError(f"{_COLOR_NAMES[color]} has two pawns on file {9 - file_index}")
+        if (
+            not _STUCK_ON_LAST_RANK[BLACK].isdisjoint(board[:9])
+            or KNIGHT in board[9:18]
+            or not _STUCK_ON_LAST_RANK[WHITE].isdisjoint(board[72:])
+            or -KNIGHT in board[63:72]
+        ):
+            square = next(
+                square
+                for square, piece in enumerate(board)
+                if piece and not _can_move_without_promotion(abs(piece), square, _piece_color(piece))
+            )
+            piece = board[square]
+            raise ValueError(
+                f"{_COLOR_NAMES[_piece_color(piece)]} {_PIECE_NAMES[abs(piece)]} on {square_name(square)} can never move"
+            )
+        if self.is_attacked_by(self.turn, self._king_squares[1 - self.turn]):
+            raise ValueError("the side not to move is in check")
 
     def _pseudo_legal_moves(self) -> list[Move]:
         moves: list[Move] = []
@@ -540,19 +612,69 @@ def square_from_name(name: str) -> int:
     return rank * 9 + file_index
 
 
-def _parse_hands(hand_part: str) -> dict[int, dict[int, int]]:
+def _is_decimal(text: str) -> bool:
+    return all("0" <= char <= "9" for char in text)
+
+
+# Nine ranks from a to i separated by "/", each nine squares from file 9 to 1: a digit for that many empty squares,
+# a letter for a piece, "+" before a letter for a promoted one.
+def _parse_board(board_part: str, sfen: str) -> list[int]:
+    ranks = board_part.split("/")
+    if len(ranks) != 9:
+        raise ValueError(f"sfen board needs 9 ranks: {sfen!r}")
+    board = [0] * BOARD_SIZE
+    for rank, text in enumerate(ranks):
+        file_index = 0
+        promoted = False
+        for char in text:
+            if not promoted:
+                if char == "+":
+                    promoted = True
+                    continue
+                if "1" <= char <= "9":
+                    file_index += int(char)
+                    continue
+            letter = _SFEN_LETTERS.get(char)
+            if letter is None:
+                raise ValueError(f"sfen board has an invalid piece {char!r}: {sfen!r}")
+            color, piece_type = letter
+            if promoted:
+                if piece_type not in PROMOTED:
+                    raise ValueError(f"sfen board promotes a piece that cannot promote: {sfen!r}")
+                piece_type = PROMOTED[piece_type]
+                promoted = False
+            if file_index < 9:
+                board[rank * 9 + file_index] = _signed_piece(color, piece_type)
+            file_index += 1
+        if promoted:
+            raise ValueError(f"sfen board ends a rank with '+': {sfen!r}")
+        if file_index != 9:
+            raise ValueError(f"sfen board rank {chr(ord('a') + rank)} does not have 9 squares: {sfen!r}")
+    return board
+
+
+# "-" for none, or each kind a side holds once, its count before it when more than one.
+def _parse_hands(hand_part: str, sfen: str) -> dict[int, dict[int, int]]:
     hands: dict[int, dict[int, int]] = {BLACK: {}, WHITE: {}}
     if hand_part == "-":
         return hands
     count_text = ""
     for char in hand_part:
-        if char.isdigit():
+        if "0" <= char <= "9":
             count_text += char
             continue
+        if char not in _SFEN_LETTERS or _SFEN_LETTERS[char][1] == KING:
+            raise ValueError(f"sfen hands have an invalid piece {char!r}: {sfen!r}")
+        color, piece_type = _SFEN_LETTERS[char]
         count = int(count_text) if count_text else 1
+        if count == 0:
+            raise ValueError(f"sfen hands hold none of {char!r}: {sfen!r}")
+        if piece_type in hands[color]:
+            raise ValueError(f"sfen hands list {char!r} twice: {sfen!r}")
+        hands[color][piece_type] = count
         count_text = ""
-        color = BLACK if char.isupper() else WHITE
-        hands[color][SFEN_TO_PIECE[char.upper()]] = count
+    if count_text:
+        raise ValueError(f"sfen hands end in a count: {sfen!r}")
     return hands
 
 
