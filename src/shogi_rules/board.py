@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import re
 
 BLACK = 0
@@ -131,6 +132,21 @@ class Piece:
     color: int
 
 
+class Termination(Enum):
+    # The side to move has no legal move, which loses in shogi even when it is not in check.
+    CHECKMATE = "checkmate"
+    # The same position for the fourth time: a draw.
+    REPETITION = "repetition"
+    # The same position for the fourth time while one side gave check with every move: that side loses.
+    PERPETUAL_CHECK = "perpetual_check"
+
+
+@dataclass(frozen=True, slots=True)
+class Outcome:
+    termination: Termination
+    winner: int | None
+
+
 @dataclass(frozen=True, slots=True)
 class _Undo:
     move: Move
@@ -159,6 +175,8 @@ class Board:
         self._check_position()
         self._hash = self._compute_hash()
         self.move_stack: list[_Undo] = []
+        # How many times each position has occurred since the last null move, one count per stretch between them.
+        self._position_counts: list[dict[int, int]] = [{self._hash: 1}]
 
     @classmethod
     def startpos(cls) -> Board:
@@ -219,6 +237,7 @@ class Board:
         self._king_squares = other._king_squares
         self._hash = other._hash
         self.move_stack = []
+        self._position_counts = other._position_counts
 
     @property
     def legal_moves(self) -> list[Move]:
@@ -248,7 +267,7 @@ class Board:
                 if not self.is_attacked_by(self.turn, self._king_squares[1 - self.turn]):
                     moves.append(move)
             finally:
-                self.pop()
+                self._pop()
         return moves
 
     def has_legal_move(self) -> bool:
@@ -260,7 +279,7 @@ class Board:
                 if not self.is_attacked_by(self.turn, self._king_squares[1 - self.turn]):
                     return True
             finally:
-                self.pop()
+                self._pop()
         return False
 
     def legal_move_usis(self) -> set[str]:
@@ -282,7 +301,7 @@ class Board:
                 if tactical or self.is_check():
                     moves.append(move)
             finally:
-                self.pop()
+                self._pop()
         return moves
 
     # Plays a move given as text only if it is legal.
@@ -290,13 +309,29 @@ class Board:
         move = Move.from_usi(usi)
         if move not in self.generate_legal_moves():
             raise ValueError(f"illegal move {usi!r} in {self.sfen()!r}")
-        self._push(move)
+        self._play(move)
 
     # Plays a move without checking that it is legal, which is the caller's to ensure (a move from legal_moves is).
     # Only a move that would break the board raises ValueError, leaving the position unchanged.
     def push(self, move: Move) -> None:
         self._check_move(move)
+        self._play(move)
+
+    def pop(self) -> None:
+        move = self.move_stack[-1].move
+        if move.from_square is None and move.to_square is None:
+            self._position_counts.pop()
+        else:
+            self._position_counts[-1][self._hash] -= 1
+        self._pop()
+
+    def _play(self, move: Move) -> None:
         self._push(move)
+        if move.from_square is None and move.to_square is None:
+            self._position_counts.append({self._hash: 1})
+        else:
+            counts = self._position_counts[-1]
+            counts[self._hash] = counts.get(self._hash, 0) + 1
 
     # A null move has no squares. Any other move goes to a square on the board without taking a king: a piece of the
     # side to move from a square, taking no piece of its own and promoting only if it can, or a piece in hand dropped
@@ -369,7 +404,7 @@ class Board:
         self.move_number += 1
         self.move_stack.append(_Undo(move, moved_piece, captured_piece, previous_turn, previous_move_number, previous_hash))
 
-    def pop(self) -> None:
+    def _pop(self) -> None:
         undo = self.move_stack.pop()
         move = undo.move
         self.turn = undo.previous_turn
@@ -425,10 +460,41 @@ class Board:
         return self.is_attacked_by(1 - self.turn, self.king_square(self.turn))
 
     def is_game_over(self) -> bool:
-        return not self.legal_moves
+        return self.outcome() is not None
 
+    # The current position has occurred four times since the board was set or the last null move.
     def is_fourfold_repetition(self) -> bool:
-        return False
+        return self._position_counts[-1].get(self._hash, 0) >= 4
+
+    def outcome(self) -> Outcome | None:
+        if self.is_fourfold_repetition():
+            checker = self._perpetual_checker()
+            if checker is None:
+                return Outcome(Termination.REPETITION, None)
+            return Outcome(Termination.PERPETUAL_CHECK, 1 - checker)
+        if not self.has_legal_move():
+            return Outcome(Termination.CHECKMATE, 1 - self.turn)
+        return None
+
+    # The side whose every move since the first of the last four occurrences of this position gave check, or None
+    # when neither or both did. The moves are taken back and played again to see each position on the way.
+    def _perpetual_checker(self) -> int | None:
+        current = self._hash
+        moves: list[Move] = []
+        occurrences = 1
+        while occurrences < 4:
+            moves.append(self.move_stack[-1].move)
+            self._pop()
+            if self._hash == current:
+                occurrences += 1
+        gave_check = [True, True]
+        for move in reversed(moves):
+            mover = self.turn
+            self._push(move)
+            gave_check[mover] = gave_check[mover] and self.is_check()
+        if gave_check[BLACK] == gave_check[WHITE]:
+            return None
+        return BLACK if gave_check[BLACK] else WHITE
 
     def zobrist_hash(self) -> int:
         return self._hash
@@ -589,7 +655,7 @@ class Board:
                 return False
             return not self._has_legal_evasion_without_pawn_drop_mate_check()
         finally:
-            self.pop()
+            self._pop()
 
     def _has_legal_evasion_without_pawn_drop_mate_check(self) -> bool:
         for response in self._pseudo_legal_moves():
@@ -598,7 +664,7 @@ class Board:
                 if not self.is_attacked_by(self.turn, self.king_square(1 - self.turn)):
                     return True
             finally:
-                self.pop()
+                self._pop()
         return False
 
     def _piece_attacks_square(self, from_square: int, piece_type: int, color: int, target_square: int) -> bool:

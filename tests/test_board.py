@@ -5,7 +5,7 @@ import unittest
 
 import shogi
 
-from shogi_rules import BLACK, KING, PAWN, PROM_PAWN, WHITE, Board, Move
+from shogi_rules import BLACK, KING, PAWN, PROM_PAWN, WHITE, Board, Move, Outcome, Termination
 
 STARTPOS = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
 MALFORMED_SFENS = (
@@ -105,6 +105,46 @@ ILLEGAL_USIS = (
     ("k3r4/9/9/9/9/9/9/4G4/4K4 b - 1", "5h4h"),
     ("8k/9/6NG1/9/9/9/9/9/4K4 b P 1", "P*1b"),
 )
+
+KING_SHUFFLE = ("5i5h", "5a5b", "5h5i", "5b5a")
+# Black's rook checks the white king from 2c and 1c in turn.
+ROOK_CHECKS = ("2c1c", "1a2a", "1c2c", "2a1a")
+
+
+def play(board: Board, moves: tuple[str, ...], times: int) -> list[Outcome | None]:
+    outcomes = []
+    for _ in range(times):
+        for usi in moves:
+            board.push_usi(usi)
+            outcomes.append(board.outcome())
+    return outcomes
+
+
+def find_cycle(board: Board) -> list[str] | None:
+    # Two moves, one for each side, that the next two moves take back.
+    def reversible(move: Move) -> bool:
+        return move.from_square is not None and not move.promotion and board.board[move.to_square] == 0
+
+    for first in [move for move in board.legal_moves if reversible(move)][:6]:
+        board.push(first)
+        try:
+            for second in [move for move in board.legal_moves if reversible(move)][:6]:
+                board.push(second)
+                try:
+                    back = Move(first.to_square, first.from_square)
+                    if back not in board.legal_moves:
+                        continue
+                    board.push(back)
+                    try:
+                        if Move(second.to_square, second.from_square) in board.legal_moves:
+                            return [first.usi(), second.usi(), back.usi(), Move(second.to_square, second.from_square).usi()]
+                    finally:
+                        board.pop()
+                finally:
+                    board.pop()
+        finally:
+            board.pop()
+    return None
 
 
 class SfenTest(unittest.TestCase):
@@ -216,6 +256,61 @@ class PushTest(unittest.TestCase):
         self.assertEqual(board.sfen(), STARTPOS)
 
 
+class OutcomeTest(unittest.TestCase):
+    def test_reports_fourfold_repetition_as_a_draw(self) -> None:
+        board = Board.startpos()
+
+        outcomes = play(board, KING_SHUFFLE, 3)
+
+        self.assertEqual(outcomes[:-1], [None] * 11)
+        self.assertEqual(outcomes[-1], Outcome(Termination.REPETITION, None))
+        self.assertTrue(board.is_fourfold_repetition())
+        self.assertTrue(board.is_game_over())
+        board.pop()
+        self.assertIsNone(board.outcome())
+
+    def test_reports_perpetual_check_as_a_loss_for_the_checking_side(self) -> None:
+        board = Board.from_sfen("8k/9/7R1/9/9/9/9/9/K8 b - 1")
+
+        outcomes = play(board, ROOK_CHECKS, 3)
+
+        self.assertEqual(outcomes[-1], Outcome(Termination.PERPETUAL_CHECK, WHITE))
+        self.assertEqual(board.sfen(), "8k/9/7R1/9/9/9/9/9/K8 b - 13")
+
+    def test_counts_checks_from_the_first_of_the_four_occurrences(self) -> None:
+        board = Board.from_sfen("8k/9/8p/7R1/9/9/9/9/K8 b - 1")
+        board.push_usi("2d2c")
+        board.push_usi("1c1d")
+
+        outcomes = play(board, ROOK_CHECKS, 3)
+
+        self.assertEqual(outcomes[-1], Outcome(Termination.PERPETUAL_CHECK, WHITE))
+
+    def test_counts_no_position_before_a_null_move(self) -> None:
+        board = Board.startpos()
+        play(board, KING_SHUFFLE, 2)
+        board.push(Move(None, None))
+        board.push(Move(None, None))
+
+        self.assertFalse(board.is_fourfold_repetition())
+        play(board, KING_SHUFFLE, 3)
+        self.assertTrue(board.is_fourfold_repetition())
+
+    def test_counts_again_after_set_sfen(self) -> None:
+        board = Board.startpos()
+        play(board, KING_SHUFFLE, 3)
+
+        board.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 13")
+
+        self.assertFalse(board.is_fourfold_repetition())
+
+    def test_reports_no_legal_move_as_a_loss_for_the_side_to_move(self) -> None:
+        board = Board.from_sfen("4k4/4G4/4P4/9/9/9/9/9/4K4 w - 1")
+
+        self.assertEqual(board.outcome(), Outcome(Termination.CHECKMATE, BLACK))
+        self.assertTrue(board.is_game_over())
+
+
 class BoardOracleTest(unittest.TestCase):
     def test_startpos_legal_moves_match_python_shogi(self) -> None:
         board = Board.startpos()
@@ -316,6 +411,33 @@ class BoardOracleTest(unittest.TestCase):
 
         self.assertEqual(board.sfen(), initial_sfen)
         self.assertEqual(board.zobrist_hash(), initial_hash)
+
+    def test_fourfold_repetition_matches_python_shogi(self) -> None:
+        rng = random.Random(3)
+        cycles = 0
+        for _ in range(8):
+            board = Board.startpos()
+            reference = shogi.Board()
+            for _ in range(rng.randrange(0, 40)):
+                moves = sorted(board.legal_move_usis())
+                if not moves:
+                    break
+                move_usi = rng.choice(moves)
+                board.push_usi(move_usi)
+                reference.push_usi(move_usi)
+            cycle = find_cycle(board)
+            if cycle is None:
+                continue
+            cycles += 1
+            for _ in range(3):
+                for move_usi in cycle:
+                    board.push_usi(move_usi)
+                    reference.push_usi(move_usi)
+                    self.assertEqual(board.is_fourfold_repetition(), reference.is_fourfold_repetition())
+                    self.assertEqual(board.is_game_over(), reference.is_game_over())
+            self.assertTrue(board.is_fourfold_repetition())
+
+        self.assertGreater(cycles, 0)
 
     def test_rejects_drop_without_hand_piece(self) -> None:
         board = Board.startpos()

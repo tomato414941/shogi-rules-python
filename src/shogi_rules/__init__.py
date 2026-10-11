@@ -19,7 +19,9 @@ from shogi_rules.board import (
     WHITE,
     Board,
     Move,
+    Outcome,
     Piece,
+    Termination,
     square_from_name,
     square_name,
 )
@@ -45,7 +47,9 @@ __all__ = [
     "WHITE",
     "Board",
     "Move",
+    "Outcome",
     "Piece",
+    "Termination",
     "square_from_name",
     "square_name",
 ]
